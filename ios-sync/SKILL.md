@@ -60,6 +60,17 @@ echo "SESSION_KIND: $_SESSION_KIND"
 if [ "$_SESSION_KIND" != "headless" ] && { [ -n "${CONDUCTOR_WORKSPACE_PATH:-}" ] || [ -n "${CONDUCTOR_PORT:-}" ]; }; then
   echo "CONDUCTOR_SESSION: true"
 fi
+_ACTIVATED=$([ -f ~/.gstack/.activated ] && echo "yes" || echo "no")
+_FIRST_LOOP_SHOWN=$([ -f ~/.gstack/.first-loop-tip-shown ] && echo "yes" || echo "no")
+echo "ACTIVATED: $_ACTIVATED"
+echo "FIRST_LOOP_SHOWN: $_FIRST_LOOP_SHOWN"
+# First-run project detection: run the detector ONLY on the first-ever skill run
+# (ACTIVATED=no, interactive) so it stays off the hot path for every run after.
+_FIRST_TASK=""
+if [ "$_ACTIVATED" = "no" ] && [ "$_SESSION_KIND" != "headless" ]; then
+  _FIRST_TASK=$(~/.claude/skills/gstack/bin/gstack-first-task-detect 2>/dev/null || true)
+fi
+echo "FIRST_TASK: $_FIRST_TASK"
 _LAKE_SEEN=$([ -f ~/.gstack/.completeness-intro-seen ] && echo "yes" || echo "no")
 echo "LAKE_INTRO: $_LAKE_SEEN"
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || true)
@@ -231,6 +242,24 @@ touch ~/.gstack/.proactive-prompted
 ```
 
 Skip if `PROACTIVE_PROMPTED` is `yes`.
+
+## First-run guidance (one-time)
+
+If `ACTIVATED` is `no` (first skill run on this machine) AND the preamble printed a non-empty `FIRST_TASK:` value that is NOT `nongit`: show ONE short, project-specific line mapped from the token, as a heads-up, then CONTINUE with whatever the user actually asked — do NOT halt their task. Map the token: `greenfield` → "Fresh repo — shape it first with `/spec` or `/office-hours`." `code_node`/`code_python`/`code_rust`/`code_go`/`code_ruby`/`code_ios` → "There's code here — `/qa` to see it work, or `/investigate` if something's off." `branch_ahead` → "Unshipped work on this branch — `/review` then `/ship`." `dirty_default` → "Uncommitted changes — `/review` before committing." `clean_default` → "Pick one: `/spec`, `/investigate`, or `/qa`." Then substitute the token you saw for TASK_TOKEN and run (best-effort), and mark activated:
+```bash
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type first_task_scaffold_shown --skill "TASK_TOKEN" --outcome shown 2>/dev/null || true
+touch ~/.gstack/.activated 2>/dev/null || true
+```
+
+If `ACTIVATED` is `no` but `FIRST_TASK:` is empty or `nongit` (headless, non-git, or nothing actionable): show nothing, just run `touch ~/.gstack/.activated 2>/dev/null || true`.
+
+Else if `ACTIVATED` is `yes` AND `FIRST_LOOP_SHOWN` is `no`: say once as a heads-up (then continue):
+
+> Tip: gstack pays off when you complete one loop — **plan → review → ship**. A common first loop: `/office-hours` or `/spec` to shape it, `/plan-eng-review` to lock it, then `/ship`.
+
+Then run `touch ~/.gstack/.first-loop-tip-shown 2>/dev/null || true`.
+
+Skip this section if `ACTIVATED` and `FIRST_LOOP_SHOWN` are both `yes`.
 
 If `HAS_ROUTING` is `no` AND `ROUTING_DECLINED` is `false` AND `PROACTIVE_PROMPTED` is `yes`:
 Check if a CLAUDE.md file exists in the project root. If it does not exist, create it.
@@ -791,49 +820,53 @@ After `/ios-qa` is installed in an app, the user may:
 
 1. Add new `@Observable` classes or properties that need accessor coverage.
 2. Upgrade gstack to a newer version with hardening fixes.
-3. Move the `@Snapshotable` marker to a different field.
+3. Move the `// @Snapshotable` generator marker comment to a different field.
 
 This skill regenerates the relevant artifacts in place.
 
-**Templates live in upstream gstack.** This skill resolves them from
-`~/.claude/skills/gstack/ios-qa/templates/` (or the worktree's
-`ios-qa/templates/` when developing gstack itself). The fork's HTTP-fetch
-pattern is gone.
+**Templates live in upstream gstack.** The installed
+`gstack-ios-qa-regen` launcher resolves its own gstack root and copies only
+the supported bridge files from `ios-qa/templates/`. The fork's HTTP-fetch
+and wildcard-copy patterns are gone.
 
 ## Phase 1: Detect installed version
 
 1. Read `<app>/DebugBridgeGenerated/.gstack-version` (written by /ios-qa
    during install). If missing, treat the install as "unknown old version".
-2. Read upstream version from `$GSTACK_HOME/ios-qa/.gstack-version` (or the
-   value baked into the installed gstack binary).
+2. Read upstream version from `$GSTACK_ROOT/VERSION`.
 3. If versions match AND no new `@Observable` classes were added, exit
    early with "already up to date".
 
 ## Phase 2: Regenerate codegen output
 
-Run `gstack-ios-qa-regen` (or the underlying SwiftPM tool directly):
+Run the deterministic regenerator once. `--app-source` is the directory the
+accessor scanner should inspect; `--bridge-dir` is the local Swift package
+that the app links in Debug builds:
 
 ```bash
-swift run --package-path "$GSTACK_HOME/ios-qa/scripts/gen-accessors-tool" \
-  gen-accessors --input "$APP_SOURCE_DIR" --output "$APP_SOURCE_DIR/DebugBridgeGenerated"
+~/.claude/skills/gstack/bin/gstack-ios-qa-regen \
+  --app-source "$APP_SOURCE_DIR" \
+  --bridge-dir "$APP_SOURCE_DIR/DebugBridge"
 ```
+
+The command removes only the known obsolete generated files from the former
+flat `DebugBridgeGenerated/` layout before emitting the current accessor.
+Generation accepts file-scope observable classes and JSON-native scalar,
+array, String-keyed dictionary, and Optional field types. It rejects custom
+types, implicitly unwrapped Optionals, nested observable classes, and duplicate
+snapshot keys before writing a completion marker.
 
 The composite-hash cache key handles whether anything actually needs
 regenerating; if Swift version, generator git rev, lockfile, source content,
 and platform triple all match the cache, this is a ~50ms no-op.
 
-## Phase 3: Update templated Swift files in place
+## Phase 3: Review the generated diff
 
-For each file that comes from `ios-qa/templates/*.swift.template`:
-
-1. Read the current installed file at
-   `<app>/DebugBridgeGenerated/<Name>.swift`.
-2. Read the upstream template at
-   `$GSTACK_HOME/ios-qa/templates/<Name>.swift.template`.
-3. If the installed file has a `// GSTACK-EDIT-LINE` marker, fold the user's
-   edits forward.
-4. Otherwise, replace the file outright with the new template (after
-   AskUserQuestion if the diff is non-trivial).
+1. Review changes under `<app>/DebugBridge/` and
+   `<app>/DebugBridgeGenerated/StateAccessor.swift`.
+2. Confirm the command did not modify the app's handwritten Swift files.
+3. Keep app-specific wiring in the app target; canonical bridge package files
+   are regenerated from upstream and should not be hand-edited.
 
 ## Phase 4: Verify
 
@@ -847,5 +880,6 @@ For each file that comes from `ios-qa/templates/*.swift.template`:
 | Symptom | Action |
 |---|---|
 | Swift compile fails after regen | Revert via `git restore` + AskUserQuestion: surface the compile error |
-| Schema hash unchanged after adding new @Observable | The new class isn't marked `@Snapshotable` — the codegen excludes it correctly. If the user wanted it snapshotted, add the wrapper. |
-| `--input` source dir contains test fixtures | gen-accessors scans the input dir recursively; exclude test/ via `--exclude` |
+| Codegen reports an invalid marked declaration | Use a file-scope observable class and a writable instance `var` with an explicit JSON-native type, internal/public setter, and a key unique across models; otherwise remove the `// @Snapshotable` marker. |
+| Schema hash unchanged after adding new @Observable | No field has the standalone `// @Snapshotable` marker comment — codegen excludes unmarked state correctly. Add the comment immediately above each field that should be snapshotted. |
+| Scanner sees generated bridge sources | Pass the narrow app source directory; the regenerator automatically excludes `DebugBridgeGenerated` and `StateAccessor.swift`. |

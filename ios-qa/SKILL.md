@@ -66,6 +66,17 @@ echo "SESSION_KIND: $_SESSION_KIND"
 if [ "$_SESSION_KIND" != "headless" ] && { [ -n "${CONDUCTOR_WORKSPACE_PATH:-}" ] || [ -n "${CONDUCTOR_PORT:-}" ]; }; then
   echo "CONDUCTOR_SESSION: true"
 fi
+_ACTIVATED=$([ -f ~/.gstack/.activated ] && echo "yes" || echo "no")
+_FIRST_LOOP_SHOWN=$([ -f ~/.gstack/.first-loop-tip-shown ] && echo "yes" || echo "no")
+echo "ACTIVATED: $_ACTIVATED"
+echo "FIRST_LOOP_SHOWN: $_FIRST_LOOP_SHOWN"
+# First-run project detection: run the detector ONLY on the first-ever skill run
+# (ACTIVATED=no, interactive) so it stays off the hot path for every run after.
+_FIRST_TASK=""
+if [ "$_ACTIVATED" = "no" ] && [ "$_SESSION_KIND" != "headless" ]; then
+  _FIRST_TASK=$(~/.claude/skills/gstack/bin/gstack-first-task-detect 2>/dev/null || true)
+fi
+echo "FIRST_TASK: $_FIRST_TASK"
 _LAKE_SEEN=$([ -f ~/.gstack/.completeness-intro-seen ] && echo "yes" || echo "no")
 echo "LAKE_INTRO: $_LAKE_SEEN"
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || true)
@@ -237,6 +248,24 @@ touch ~/.gstack/.proactive-prompted
 ```
 
 Skip if `PROACTIVE_PROMPTED` is `yes`.
+
+## First-run guidance (one-time)
+
+If `ACTIVATED` is `no` (first skill run on this machine) AND the preamble printed a non-empty `FIRST_TASK:` value that is NOT `nongit`: show ONE short, project-specific line mapped from the token, as a heads-up, then CONTINUE with whatever the user actually asked — do NOT halt their task. Map the token: `greenfield` → "Fresh repo — shape it first with `/spec` or `/office-hours`." `code_node`/`code_python`/`code_rust`/`code_go`/`code_ruby`/`code_ios` → "There's code here — `/qa` to see it work, or `/investigate` if something's off." `branch_ahead` → "Unshipped work on this branch — `/review` then `/ship`." `dirty_default` → "Uncommitted changes — `/review` before committing." `clean_default` → "Pick one: `/spec`, `/investigate`, or `/qa`." Then substitute the token you saw for TASK_TOKEN and run (best-effort), and mark activated:
+```bash
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type first_task_scaffold_shown --skill "TASK_TOKEN" --outcome shown 2>/dev/null || true
+touch ~/.gstack/.activated 2>/dev/null || true
+```
+
+If `ACTIVATED` is `no` but `FIRST_TASK:` is empty or `nongit` (headless, non-git, or nothing actionable): show nothing, just run `touch ~/.gstack/.activated 2>/dev/null || true`.
+
+Else if `ACTIVATED` is `yes` AND `FIRST_LOOP_SHOWN` is `no`: say once as a heads-up (then continue):
+
+> Tip: gstack pays off when you complete one loop — **plan → review → ship**. A common first loop: `/office-hours` or `/spec` to shape it, `/plan-eng-review` to lock it, then `/ship`.
+
+Then run `touch ~/.gstack/.first-loop-tip-shown 2>/dev/null || true`.
+
+Skip this section if `ACTIVATED` and `FIRST_LOOP_SHOWN` are both `yes`.
 
 If `HAS_ROUTING` is `no` AND `ROUTING_DECLINED` is `false` AND `PROACTIVE_PROMPTED` is `yes`:
 Check if a CLAUDE.md file exists in the project root. If it does not exist, create it.
@@ -854,17 +883,33 @@ fi
 ## Phase 1: Read source, plan codegen
 
 1. Walk the app source (passed as `--source <dir>`) and identify all `@Observable`
-   classes. Note any property marked with the `@Snapshotable` wrapper — those
-   are the snapshot-eligible fields.
-2. Run `swift run --package-path $GSTACK_HOME/ios-qa/scripts/gen-accessors-tool gen-accessors --input <source-dir>`.
-   First invocation builds the swift-syntax dependency tree (cold: 2-5 min).
-   Subsequent runs are content-hash-cached and finish in ~50ms.
-3. Show the user the accessor list and ask whether to install the DebugBridge
+   classes. Note any property immediately preceded by the generator marker
+   comment `// @Snapshotable` — those are the snapshot-eligible fields. The
+   marker is a comment so it composes with the `@Observable` macro. Each
+   marked field must belong to a file-scope observable class and be a writable
+   instance `var` with an explicit type and an internal or public setter.
+   Snapshot types are JSON-native scalars (`String`, `Bool`, integer widths,
+   `Float`, `Double`, `CGFloat`), arrays, String-keyed dictionaries, and their
+   Optional compositions. Keys must be unique across observable classes.
+   Codegen stops with a source diagnostic instead of emitting a broken or
+   lossy harness when any of these constraints is violated.
+2. Show the user the accessor list and ask whether to install the DebugBridge
    SPM dependency into their `Package.swift` (one AskUserQuestion).
 
 ## Phase 2: Bootstrap the device bridge
 
-1. Add the `DebugBridge` SPM dependency to the app's `Package.swift`. The package
+1. Generate the canonical local bridge package, typed accessors, and installed
+   version marker with one deterministic command:
+   ```bash
+   ~/.claude/skills/gstack/bin/gstack-ios-qa-regen \
+     --app-source "<source-dir>" \
+     --bridge-dir "<source-dir>/DebugBridge"
+   ```
+   The regenerator also removes the explicit obsolete flat-file set created by
+   older ios-sync versions, preventing a stale second harness from remaining
+   in the app target.
+2. Add the generated `DebugBridge` local SPM dependency to the app's
+   `Package.swift`. The package
    ships three Debug-config-only library products:
    - `DebugBridgeCore` (Swift, cross-platform) — StateServer + bridge protocols.
    - `DebugBridgeTouch` (Objective-C, iOS-only) — KIF-derived in-process touch
@@ -874,27 +919,35 @@ fi
    The app target depends on `DebugBridgeUI` with `.when(configuration: .debug)`
    (transitively pulls in Core + Touch). Release builds refuse to link these
    targets.
-2. Wire the bridges from the `@main` App init, gated on `#if DEBUG`:
+3. Wire the bridges from the `@main` App init, gated on `#if DEBUG`:
    ```swift
    #if DEBUG
    import DebugBridgeCore
-   StateServer.shared.start()
    #if canImport(UIKit)
    import DebugBridgeUI
+   // Install resolvers before StateServer opens its listener.
    DebugBridgeUIWiring.installAll()
    #endif
+   // Replace AppState/AppStateAccessor with the type discovered in Phase 1.
+   DebugBridgeManager.shared.start(
+       appState: appState,
+       register: AppStateAccessor.register
+   )
    #endif
    ```
-3. Build + deploy to the device with `xcodebuild -scheme <SchemeName>
+4. Build + deploy to the device with `xcodebuild -scheme <SchemeName>
    -destination 'platform=iOS,id=<UDID>' build install`.
-4. Launch via `devicectl device process launch --device <UDID> --console <bundle-id>`.
+5. Launch via `devicectl device process launch --device <UDID> --console <bundle-id>`.
    Capture the boot token printed to `os_log` on first run.
-5. Spawn the Mac-side daemon (on-demand) — `gstack-ios-qa-daemon`. Daemon
+6. Spawn the Mac-side daemon (on-demand) — `gstack-ios-qa-daemon`. Daemon
    acquires an exclusive flock on `~/.gstack/ios-qa-daemon.pid`. If another
    daemon is alive, the second invocation discovers its port and connects.
-6. Daemon immediately calls `POST /auth/rotate` on the iOS StateServer with a
+7. Daemon immediately calls `POST /auth/rotate` on the iOS StateServer with a
    fresh in-memory-only token. The boot token becomes useless ~5s later.
    Anything scraping `os_log` past this point sees a dead credential.
+   If a fresh daemon finds the app running after another daemon consumed that
+   one-use token, it verifies the bundle owner, relaunches the target once,
+   waits for the new token, verifies ownership again, and then rotates.
 
 ## Phase 3: Vision-driven agent loop
 
@@ -902,7 +955,7 @@ Each iteration:
 
 1. `GET /screenshot` (via daemon) → save PNG.
 2. `GET /elements` → accessibility tree.
-3. `GET /state/snapshot` (only `@Snapshotable` fields) → current state.
+3. `GET /state/snapshot` (only `// @Snapshotable` fields) → current state.
 4. Decide next action based on what's on the screen vs the test goal.
 5. `POST /session/acquire` to grab the device lock.
 6. Execute `POST /tap`, `/swipe`, `/type`, or `POST /state/<key>` write.
@@ -966,7 +1019,7 @@ live.
 | `curl: connection refused` to daemon | daemon crashed | Re-run `/ios-qa`; spawn-race lock will fail closed |
 | `403 identity_not_allowed` from `/auth/mint` | identity missing from allowlist | Run `gstack-ios-qa-mint --remote <identity>` on the Mac |
 | `409 schema_mismatch` on `/state/restore` | snapshot from older app build | Discard the snapshot; re-capture |
-| `503 device_disconnected` from proxy | USB tunnel dropped | Reconnect device; daemon auto-reconnects within 30s |
+| `503 device_disconnected` from proxy | USB route dropped or app relaunched | Daemon invalidates the stale tunnel and retries one fresh bootstrap; reconnect/unlock the iPhone if it persists |
 | `429 rate_limited` from `/auth/mint` | >10 mints/min from one identity | Wait 60s; check audit log for anomalies |
 | `413 body_too_large` on `/state/restore` | snapshot >1MB | Increase `--max-body` or trim snapshot |
 
