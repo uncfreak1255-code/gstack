@@ -51,5 +51,21 @@ fi
 RAW_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || RAW_BRANCH=""
 BRANCH=$(printf '%s' "${RAW_BRANCH:-}" | tr -cd 'a-zA-Z0-9._-')
 BRANCH="${BRANCH:-unknown}"
+
+# 5. Signal how the slug was resolved so checkpoint skills (context-save /
+#    context-restore) can warn when it is a folder-name fallback. With no git
+#    remote, the slug is just basename($PWD): a save and a restore run from two
+#    different directories then land in two different per-folder buckets and
+#    silently never match (the exact failure that loses a saved checkpoint).
+#    Deliberately independent of the cache above, so a previously-cached
+#    fallback slug is still reported as a fallback. Additive output only —
+#    existing SLUG=/BRANCH= consumers are unaffected.
+if git remote get-url origin >/dev/null 2>&1; then
+  SLUG_SOURCE="git"
+else
+  SLUG_SOURCE="basename-fallback"
+fi
+
 echo "SLUG=$SLUG"
 echo "BRANCH=$BRANCH"
+echo "SLUG_SOURCE=$SLUG_SOURCE"

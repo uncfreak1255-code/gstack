@@ -101,6 +101,9 @@ for _PF in $(find ~/.gstack/analytics -maxdepth 1 -name '.pending-*' 2>/dev/null
   break
 done
 eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+if [ "${SLUG_SOURCE:-}" = "basename-fallback" ]; then
+  echo "SLUG_WARNING: cwd is not a git repo with a remote — restore is keyed on folder name '${SLUG:-unknown}', so it will only find checkpoints saved from this exact directory, NOT ones saved from your actual repo. If you expected saved work here, cd into that repo and re-run /context-restore."
+fi
 _LEARN_FILE="${GSTACK_HOME:-$HOME/.gstack}/projects/${SLUG:-unknown}/learnings.jsonl"
 if [ -f "$_LEARN_FILE" ]; then
   _LEARN_COUNT=$(wc -l < "$_LEARN_FILE" 2>/dev/null | tr -d ' ')
@@ -162,6 +165,8 @@ If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay
 If output shows `UPGRADE_AVAILABLE <old> <new>`: read `~/.claude/skills/gstack/gstack-upgrade/SKILL.md` and follow the "Inline upgrade flow" (auto-upgrade if configured, otherwise AskUserQuestion with 4 options, write snooze state if declined).
 
 If output shows `JUST_UPGRADED <from> <to>`: print "Running gstack v{to} (just updated!)". If `SPAWNED_SESSION` is true, skip feature discovery.
+
+If output shows `SLUG_WARNING: ...`: surface it to the user verbatim before reporting "nothing found". It means the current directory is not a git repo with a remote, so restore only searched the bare-folder-name bucket — a checkpoint saved from the actual repo would live under a different slug and legitimately not appear here. Recommend they `cd` into the repo and re-run before concluding no context was saved.
 
 Feature discovery, max one prompt per session:
 - Missing `~/.claude/skills/gstack/.feature-prompted-continuous-checkpoint`: AskUserQuestion for Continuous checkpoint auto-commits. If accepted, run `~/.claude/skills/gstack/bin/gstack-config set checkpoint_mode continuous`. Always touch marker.
