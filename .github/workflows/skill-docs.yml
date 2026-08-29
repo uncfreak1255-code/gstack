@@ -3,6 +3,7 @@ on: [push, pull_request]
 jobs:
   check-freshness:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -28,6 +29,6 @@ jobs:
       - name: Verify Factory skill docs are fresh
         run: |
           git diff --exit-code -- .factory/ || {
-            echo "Generated Factory SKILL.md files are stale. Run: bun run gen:skill-docs --host factory"
+            echo "Generated Factory skill docs are stale. Run: bun run gen:skill-docs --host factory"
             exit 1
           }
