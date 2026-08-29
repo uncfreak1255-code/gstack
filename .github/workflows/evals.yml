@@ -16,6 +16,7 @@ jobs:
   # Build Docker image with pre-baked toolchain (cached — only rebuilds on Dockerfile/lockfile change)
   build-image:
     runs-on: ubicloud-standard-2
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write

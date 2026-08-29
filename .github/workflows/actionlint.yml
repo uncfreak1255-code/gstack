@@ -3,6 +3,7 @@ on: [push, pull_request]
 jobs:
   actionlint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: rhysd/actionlint@v1.7.11
